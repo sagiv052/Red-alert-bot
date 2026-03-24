@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-בוט התרעות אזעקות - גרסת Render
+בוט התרעות אזעקות - גרסה עם Socket.IO (API רשמי)
 """
 
 import sqlite3
@@ -10,6 +10,7 @@ import threading
 import asyncio
 import logging
 import os
+import socketio
 from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -20,6 +21,10 @@ logger = logging.getLogger(__name__)
 
 # ============= טוקן =============
 TOKEN = os.environ.get('TOKEN', '7668475816:AAEt2Yajc_Q25sxiu1SGkSuOjPM-z5Q6yVk')
+RED_ALERT_API_KEY = os.environ.get('RED_ALERT_API_KEY', 'pr_rmwozxvWHMlSVhbVlxZkyqNdmIfGhTsTRuBONQIoOwjgYeiBJidJDnNrxzhKRzqg')
+
+# ============= Socket.IO =============
+sio = socketio.Client(logger=False, engineio_logger=False)
 
 # ============= מסד נתונים =============
 conn = sqlite3.connect('alerts_bot.db', check_same_thread=False)
@@ -58,10 +63,10 @@ CREATE TABLE IF NOT EXISTS user_settings (
 )
 ''')
 
-# בדיקה אם טבלת settlements קיימת
+# יצירת טבלת ערים אם לא קיימת
 cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='settlements'")
 if not cursor.fetchone():
-    logger.warning("⚠️ טבלת settlements לא קיימת! מנסה ליצור...")
+    logger.info("📦 יוצר טבלת ערים...")
     try:
         from cities_data import ALL_CITIES
         cursor.execute('''
@@ -363,21 +368,23 @@ def is_night_time_for_user(user_id):
     else:
         return now >= start or now < end
 
-# ============= פונקציות API =============
+# ============= פונקציות API (Socket.IO) =============
 def get_alert_area(alert):
+    """מחזיר את שם האזור מהתראה (מבנה של Socket.IO)"""
+    # מבנה של redalert.orielhaim.com
+    if 'cities' in alert and alert['cities']:
+        return alert['cities'][0] if isinstance(alert['cities'], list) else alert['cities']
     if 'city' in alert and alert['city']:
         return alert['city']
-    if 'data' in alert and isinstance(alert['data'], list) and alert['data']:
-        return alert['data'][0]
-    for key in ['area', 'title', 'location']:
-        if key in alert and alert[key]:
-            return alert[key]
+    if 'area' in alert and alert['area']:
+        return alert['area']
     return None
 
 def is_long_range_alert(alert):
     threat = alert.get('threat', 0)
     area = get_alert_area(alert) or ""
     area_lower = area.lower()
+    # threat = 4 מציין שיגור ארוך טווח
     if threat == 4:
         return True
     long_range_zones = ['מרכז', 'דרום', 'אילת', 'ים המלח', 'הערבה', 'ממשית', 'יטבתה']
@@ -437,7 +444,7 @@ def send_safe(chat_id, text, keyboard=None):
     else:
         return asyncio.create_task(send_msg(chat_id, text, keyboard))
 
-# ============= אזעקות =============
+# ============= אזעקות (Socket.IO) =============
 processed_alerts = set()
 pending_alerts = []
 pending_lock = threading.Lock()
@@ -496,12 +503,13 @@ def send_batch():
 def add_alert(alert):
     global send_timer
     alert_id = alert.get('id')
-    if alert_id in processed_alerts:
+    if alert_id and alert_id in processed_alerts:
         return
     area = get_alert_area(alert)
     if not area:
         return
-    processed_alerts.add(alert_id)
+    if alert_id:
+        processed_alerts.add(alert_id)
     logger.info(f"➕ אזעקה: {area}")
     with pending_lock:
         pending_alerts.append(alert)
@@ -510,69 +518,85 @@ def add_alert(alert):
     send_timer = threading.Timer(SEND_DELAY, send_batch)
     send_timer.start()
 
-def fetch_redalert():
-    try:
-        r = requests.get('https://redalert.me/alerts', timeout=8)
-        if r.status_code == 200:
-            return r.json()
-    except Exception as e:
-        logger.warning(f"RedAlert.me error: {e}")
-    return None
+# ============= Socket.IO Events =============
+@sio.on('connect')
+def on_connect():
+    logger.info("✅ התחבר ל-Socket.IO של RedAlert")
+    # שלח API key לאימות
+    sio.emit('authenticate', {'api_key': RED_ALERT_API_KEY})
 
-def fetch_tzevaadom():
-    try:
-        r = requests.get('https://api.tzevaadom.co.il/alerts-history', timeout=8)
-        if r.status_code == 200:
-            data = r.json()
-            if 'alerts' in data:
-                return data['alerts']
-    except Exception as e:
-        logger.warning(f"TzevaAdom error: {e}")
-    return None
+@sio.on('authenticated')
+def on_authenticated(data):
+    logger.info(f"✅ אושר: {data}")
 
-def check_alerts():
-    alerts = fetch_redalert()
-    if not alerts:
-        alerts = fetch_tzevaadom()
-    if not alerts:
-        return
+@sio.on('alert')
+def on_alert(data):
+    logger.info(f"🔴 התראה: {data}")
+    # עיבוד ההתראה
+    alert_time = data.get('time', time.time())
+    if isinstance(alert_time, str):
+        try:
+            alert_time = time.mktime(datetime.strptime(alert_time, '%Y-%m-%d %H:%M:%S').timetuple())
+        except:
+            alert_time = time.time()
+    
+    alert = {
+        'id': data.get('id', f"alert_{alert_time}"),
+        'city': data.get('cities', ['אזור לא ידוע'])[0] if data.get('cities') else 'אזור לא ידוע',
+        'date': alert_time,
+        'threat': data.get('threat', 0)
+    }
+    add_alert(alert)
 
-    now = time.time()
-    if not isinstance(alerts, list):
-        alerts = [alerts]
+@sio.on('rockets')
+def on_rockets(data):
+    logger.info(f"🚀 התראת רקטות: {data}")
+    alert_time = data.get('time', time.time())
+    if isinstance(alert_time, str):
+        try:
+            alert_time = time.mktime(datetime.strptime(alert_time, '%Y-%m-%d %H:%M:%S').timetuple())
+        except:
+            alert_time = time.time()
+    
+    alert = {
+        'id': data.get('id', f"rockets_{alert_time}"),
+        'city': data.get('cities', ['אזור לא ידוע'])[0] if data.get('cities') else 'אזור לא ידוע',
+        'date': alert_time,
+        'threat': data.get('threat', 0)
+    }
+    add_alert(alert)
 
-    for alert_group in alerts:
-        if 'alerts' in alert_group:
-            for sub in alert_group['alerts']:
-                t = sub.get('time', 0)
-                if now - t <= 120:
-                    for city in sub.get('cities', []):
-                        a = {'id': f"{city}_{t}", 'city': city, 'date': t, 'threat': sub.get('threat', 0)}
-                        if a['id'] not in processed_alerts:
-                            add_alert(a)
-        else:
-            t = alert_group.get('date', 0)
-            if not t and 'time' in alert_group:
-                try:
-                    t = time.mktime(datetime.strptime(alert_group['time'], '%Y-%m-%d %H:%M:%S').timetuple())
-                except:
-                    t = now
-            if now - t <= 120:
-                area = get_alert_area(alert_group)
-                aid = alert_group.get('id', f"{area}_{t}")
-                if aid not in processed_alerts:
-                    if area and 'city' not in alert_group:
-                        alert_group['city'] = area
-                    add_alert(alert_group)
+@sio.on('hostileAircraftIntrusion')
+def on_aircraft(data):
+    logger.info(f"✈️ חדירת כלי טיס: {data}")
+    alert_time = data.get('time', time.time())
+    if isinstance(alert_time, str):
+        try:
+            alert_time = time.mktime(datetime.strptime(alert_time, '%Y-%m-%d %H:%M:%S').timetuple())
+        except:
+            alert_time = time.time()
+    
+    alert = {
+        'id': data.get('id', f"aircraft_{alert_time}"),
+        'city': data.get('cities', ['אזור לא ידוע'])[0] if data.get('cities') else 'אזור לא ידוע',
+        'date': alert_time,
+        'threat': data.get('threat', 1)
+    }
+    add_alert(alert)
 
-def alerts_loop():
+@sio.on('disconnect')
+def on_disconnect():
+    logger.warning("⚠️ נותק מ-Socket.IO, מנסה להתחבר מחדש...")
+
+def start_socketio():
+    """מתחבר ל-Socket.IO ומקשיב להתראות"""
     while True:
         try:
-            check_alerts()
-            time.sleep(3)
+            sio.connect('https://redalert.orielhaim.com', transports=['websocket'])
+            sio.wait()
         except Exception as e:
-            logger.error(f"Alerts loop error: {e}")
-            time.sleep(10)
+            logger.error(f"שגיאת Socket.IO: {e}")
+            time.sleep(5)
 
 # ============= תפריטים =============
 def main_keyboard(user_id):
@@ -781,11 +805,13 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    alert_thread = threading.Thread(target=alerts_loop, daemon=True)
-    alert_thread.start()
+    # הפעלת Socket.IO בת'רד נפרד
+    socketio_thread = threading.Thread(target=start_socketio, daemon=True)
+    socketio_thread.start()
 
     print("=" * 50)
     print("🚀 בוט התרעות אזעקות עלה בהצלחה!")
+    print("🔌 מתחבר ל-API הרשמי של RedAlert...")
     print("=" * 50)
     print("📜 איך להשתמש:")
     print("1. שלח /start")
