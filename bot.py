@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-בוט התרעות אזעקות - גרסה עם מאגר ערים
+בוט התרעות אזעקות - גרסת Render
 """
 
 import sqlite3
@@ -9,6 +9,7 @@ import time
 import threading
 import asyncio
 import logging
+import os
 from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -18,14 +19,13 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 # ============= טוקן =============
-TOKEN = '7668475816:AAEt2Yajc_Q25sxiu1SGkSuOjPM-z5Q6yVk'
+TOKEN = os.environ.get('TOKEN', '7668475816:AAEt2Yajc_Q25sxiu1SGkSuOjPM-z5Q6yVk')
 
 # ============= מסד נתונים =============
 conn = sqlite3.connect('alerts_bot.db', check_same_thread=False)
 conn.execute("PRAGMA journal_mode=WAL")
 cursor = conn.cursor()
 
-# טבלת משתמשים
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
@@ -34,7 +34,6 @@ CREATE TABLE IF NOT EXISTS users (
 )
 ''')
 
-# טבלת ישובים של משתמשים
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS user_cities (
     user_id INTEGER,
@@ -43,7 +42,6 @@ CREATE TABLE IF NOT EXISTS user_cities (
 )
 ''')
 
-# טבלת שפות
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS user_language (
     user_id INTEGER PRIMARY KEY,
@@ -51,7 +49,6 @@ CREATE TABLE IF NOT EXISTS user_language (
 )
 ''')
 
-# טבלת מצב לילה
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS user_settings (
     user_id INTEGER PRIMARY KEY,
@@ -61,12 +58,45 @@ CREATE TABLE IF NOT EXISTS user_settings (
 )
 ''')
 
-# בדיקה אם טבלת settlements קיימת (מאגר הערים)
+# בדיקה אם טבלת settlements קיימת
 cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='settlements'")
 if not cursor.fetchone():
-    logger.warning("⚠️ טבלת settlements לא קיימת! הרץ קודם את create_cities_db.py")
-else:
-    logger.info("✅ מאגר הערים נמצא")
+    logger.warning("⚠️ טבלת settlements לא קיימת! מנסה ליצור...")
+    try:
+        from cities_data import ALL_CITIES
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS zones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            zone_name TEXT UNIQUE
+        )
+        ''')
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS settlements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            settlement_name TEXT UNIQUE,
+            zone_id INTEGER,
+            FOREIGN KEY (zone_id) REFERENCES zones(id)
+        )
+        ''')
+        
+        zones_dict = {}
+        for city, zone in ALL_CITIES:
+            if zone not in zones_dict:
+                cursor.execute('INSERT OR IGNORE INTO zones (zone_name) VALUES (?)', (zone,))
+                conn.commit()
+                cursor.execute('SELECT id FROM zones WHERE zone_name = ?', (zone,))
+                result = cursor.fetchone()
+                if result:
+                    zones_dict[zone] = result[0]
+        
+        for city, zone in ALL_CITIES:
+            zone_id = zones_dict.get(zone)
+            if zone_id:
+                cursor.execute('INSERT OR IGNORE INTO settlements (settlement_name, zone_id) VALUES (?, ?)', (city, zone_id))
+        conn.commit()
+        logger.info("✅ מאגר הערים נוצר בהצלחה")
+    except Exception as e:
+        logger.error(f"שגיאה ביצירת מאגר ערים: {e}")
 
 conn.commit()
 
@@ -282,21 +312,22 @@ def register_user(user_id, username):
 def get_expanded_cities(city_name):
     """מחזיר רשימה מורחבת של ערים לפי אזור ממסד הנתונים"""
     c = conn.cursor()
-    # מצא את האזור של העיר
-    c.execute('''
-        SELECT z.zone_name FROM settlements s 
-        JOIN zones z ON s.zone_id = z.id 
-        WHERE s.settlement_name = ? OR s.settlement_name LIKE ?
-    ''', (city_name, f'%{city_name}%'))
-    zone = c.fetchone()
-    if zone:
-        # החזר את כל הערים באותו אזור
+    try:
         c.execute('''
-            SELECT settlement_name FROM settlements s 
+            SELECT z.zone_name FROM settlements s 
             JOIN zones z ON s.zone_id = z.id 
-            WHERE z.zone_name = ?
-        ''', (zone[0],))
-        return [row[0] for row in c.fetchall()]
+            WHERE s.settlement_name = ? OR s.settlement_name LIKE ?
+        ''', (city_name, f'%{city_name}%'))
+        zone = c.fetchone()
+        if zone:
+            c.execute('''
+                SELECT settlement_name FROM settlements s 
+                JOIN zones z ON s.zone_id = z.id 
+                WHERE z.zone_name = ?
+            ''', (zone[0],))
+            return [row[0] for row in c.fetchall()]
+    except Exception as e:
+        logger.error(f"שגיאה בחיפוש ערים: {e}")
     return [city_name]
 
 # ============= פונקציות מצב לילה =============
