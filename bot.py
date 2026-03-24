@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-בוט התרעות אזעקות - גרסה עם Socket.IO (API רשמי)
+בוט התרעות אזעקות - גרסת Socket.IO עם התקנה אוטומטית
 """
 
 import sqlite3
@@ -10,10 +10,21 @@ import threading
 import asyncio
 import logging
 import os
-import socketio
+import subprocess
+import sys
 from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+# ============= התקנת websocket-client אם חסר =============
+try:
+    import websocket
+    import socketio
+except ImportError:
+    print("📦 מתקין חבילות חסרות...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "websocket-client", "python-socketio"])
+    import websocket
+    import socketio
 
 # ============= לוגים =============
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -370,8 +381,6 @@ def is_night_time_for_user(user_id):
 
 # ============= פונקציות API (Socket.IO) =============
 def get_alert_area(alert):
-    """מחזיר את שם האזור מהתראה (מבנה של Socket.IO)"""
-    # מבנה של redalert.orielhaim.com
     if 'cities' in alert and alert['cities']:
         return alert['cities'][0] if isinstance(alert['cities'], list) else alert['cities']
     if 'city' in alert and alert['city']:
@@ -384,7 +393,6 @@ def is_long_range_alert(alert):
     threat = alert.get('threat', 0)
     area = get_alert_area(alert) or ""
     area_lower = area.lower()
-    # threat = 4 מציין שיגור ארוך טווח
     if threat == 4:
         return True
     long_range_zones = ['מרכז', 'דרום', 'אילת', 'ים המלח', 'הערבה', 'ממשית', 'יטבתה']
@@ -522,7 +530,6 @@ def add_alert(alert):
 @sio.on('connect')
 def on_connect():
     logger.info("✅ התחבר ל-Socket.IO של RedAlert")
-    # שלח API key לאימות
     sio.emit('authenticate', {'api_key': RED_ALERT_API_KEY})
 
 @sio.on('authenticated')
@@ -532,7 +539,6 @@ def on_authenticated(data):
 @sio.on('alert')
 def on_alert(data):
     logger.info(f"🔴 התראה: {data}")
-    # עיבוד ההתראה
     alert_time = data.get('time', time.time())
     if isinstance(alert_time, str):
         try:
